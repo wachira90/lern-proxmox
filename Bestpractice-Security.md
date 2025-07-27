@@ -1,4 +1,6 @@
-Securing and following best practices in **Proxmox VE (Virtual Environment)** is critical, especially in production or internet-facing deployments. Here's a comprehensive guide divided into **best practices** and **security recommendations**:
+# Securing and best practices in **Proxmox VE (Virtual Environment)** 
+
+is critical, especially in production or internet-facing deployments. Here's a comprehensive guide divided into **best practices** and **security recommendations**:
 
 ---
 
@@ -233,9 +235,196 @@ Here’s a simplified **Ansible playbook** for securing a single-node Proxmox VE
 
 ---
 
-Would you like:
+Great! Here's a **comprehensive Ansible setup** for:
 
-* A **more detailed Ansible role** (e.g., including Proxmox ACLs, firewall rules)?
-* A **multi-node cluster setup** via Ansible?
-* A **template inventory file** and group vars?
+1. A **detailed Proxmox role** (`roles/proxmox_hardening`)
+2. A **multi-node cluster setup**
+3. A **template inventory file** with `group_vars`
+
+This is designed to help bootstrap secure Proxmox VE clusters in a reproducible way.
+
+---
+
+## 📁 Directory Structure
+
+```
+proxmox-ansible/
+├── inventory/
+│   └── hosts.yml
+├── group_vars/
+│   └── proxmox_nodes.yml
+├── playbooks/
+│   └── cluster_setup.yml
+├── roles/
+│   └── proxmox_hardening/
+│       ├── tasks/
+│       │   ├── main.yml
+│       │   ├── firewall.yml
+│       │   └── acl.yml
+│       └── handlers/
+│           └── main.yml
+```
+
+---
+
+## 🔐 `roles/proxmox_hardening/tasks/main.yml`
+
+```yaml
+---
+- name: Ensure latest packages are installed
+  apt:
+    update_cache: yes
+    upgrade: full
+
+- name: Disable root SSH login
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^PermitRootLogin'
+    line: 'PermitRootLogin no'
+  notify: Restart SSH
+
+- name: Install fail2ban and auditd
+  apt:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - fail2ban
+    - auditd
+
+- name: Configure Proxmox firewall
+  include_tasks: firewall.yml
+
+- name: Set up Proxmox ACLs
+  include_tasks: acl.yml
+```
+
+---
+
+## 🔥 `roles/proxmox_hardening/tasks/firewall.yml`
+
+```yaml
+---
+- name: Enable firewall at datacenter level
+  command: pve-firewall enable
+
+- name: Enable firewall at host level
+  command: pve-firewall enable --host
+
+- name: Allow SSH and web UI (port 8006)
+  shell: |
+    pve-firewall add --group proxmox-allow --macro SSH
+    pve-firewall add --group proxmox-allow --macro web
+  args:
+    executable: /bin/bash
+```
+
+---
+
+## 🔐 `roles/proxmox_hardening/tasks/acl.yml`
+
+```yaml
+---
+- name: Create 'adminuser' user if not exists
+  command: "pveum user add adminuser@pve --password yourSecurePassword"
+  ignore_errors: yes
+
+- name: Assign admin role to user
+  command: "pveum aclmod / -user adminuser@pve -role Administrator"
+```
+
+---
+
+## 🛠️ `roles/proxmox_hardening/handlers/main.yml`
+
+```yaml
+---
+- name: Restart SSH
+  service:
+    name: ssh
+    state: restarted
+```
+
+---
+
+## 🌐 `group_vars/proxmox_nodes.yml`
+
+```yaml
+---
+ssh_port: 22
+allow_ips:
+  - "192.168.1.0/24"
+admin_user: "adminuser"
+admin_password: "yourSecurePassword"
+```
+
+---
+
+## 🖧 `inventory/hosts.yml`
+
+```yaml
+all:
+  children:
+    proxmox_nodes:
+      hosts:
+        proxmox1.local:
+        proxmox2.local:
+        proxmox3.local:
+```
+
+---
+
+## 📋 `playbooks/cluster_setup.yml`
+
+```yaml
+---
+- name: Harden Proxmox and setup cluster
+  hosts: proxmox_nodes
+  become: true
+
+  roles:
+    - proxmox_hardening
+
+- name: Create Proxmox cluster (run only on first node)
+  hosts: proxmox1.local
+  become: true
+  tasks:
+    - name: Create cluster if not exists
+      shell: |
+        pvecm create mycluster
+      args:
+        creates: /etc/pve/corosync.conf
+
+- name: Join other nodes to cluster
+  hosts: proxmox_nodes:!proxmox1.local
+  become: true
+  tasks:
+    - name: Join node to cluster
+      shell: |
+        pvecm add proxmox1.local -use_ssh yes -force
+      args:
+        creates: /etc/pve/corosync.conf
+```
+
+---
+
+## 🏁 Usage
+
+Run the playbook with:
+
+```bash
+ansible-playbook -i inventory/hosts.yml playbooks/cluster_setup.yml
+```
+
+---
+
+## 🚨 Notes
+
+* Ensure passwordless SSH (or SSH keys) are configured among the nodes.
+* `pvecm add` assumes `proxmox1.local` is reachable and trusted.
+* You may want to add retry logic and health checks for production use.
+
+---
+
+
+
 
