@@ -136,3 +136,258 @@ pcs constraint order start mydrbd then myvm
 ---
 
 หากคุณต้องการ walkthrough แบบละเอียดสำหรับ **ระบบใดระบบหนึ่ง** เช่น Proxmox VE หรือ Pacemaker + KVM ผมสามารถจัดทำคู่มือแบบ step-by-step เพิ่มเติมได้ครับ ✅
+
+# การทำ HA ใน proxmox 
+
+การทำ **HA (High Availability) ใน Proxmox VE** คือการทำให้ VM หรือ Container สามารถย้ายไปทำงานบน node อื่นได้อัตโนมัติเมื่อ node หลักล่ม (node failure) เพื่อลด downtime
+
+ผมจะสรุปแบบใช้งานจริงสำหรับสาย Infra/DevOps ให้เลย 👇
+
+---
+
+# 🔹 1. Concept ของ Proxmox HA
+
+Proxmox HA ใช้ component หลัก ๆ คือ:
+
+* **Cluster (pve-cluster / corosync)** → ใช้ quorum ตัดสินว่า node ไหนยังอยู่
+* **HA Manager (pve-ha-crm, pve-ha-lrm)** → คุม resource (VM/CT)
+* **Shared Storage** → สำคัญมาก! ทุก node ต้องเข้าถึง disk เดียวกันได้
+
+เมื่อ node ตาย:
+
+* HA Manager จะ detect
+* VM จะถูก start บน node อื่นอัตโนมัติ
+
+---
+
+# 🔹 2. Requirements สำคัญ
+
+## ✅ 1) ต้องมี Proxmox Cluster อย่างน้อย 3 node (แนะนำ)
+
+> 2 node ทำได้ แต่ต้องมี QDevice เพิ่ม ไม่งั้น quorum จะมีปัญหา
+
+ตรวจสอบ cluster:
+
+```bash
+pvecm status
+```
+
+---
+
+## ✅ 2) ต้องมี Shared Storage
+
+HA จะทำงานไม่ได้ถ้า disk เป็น local storage
+
+ตัวเลือกยอดนิยม:
+
+* Ceph (ดีที่สุดสำหรับ production)
+* NFS
+* iSCSI + LVM
+* ZFS over iSCSI
+
+เช็ค storage:
+
+```bash
+pvesm status
+```
+
+---
+
+# 🔹 3. ขั้นตอนทำ HA
+
+## Step 1️⃣ สร้าง Cluster
+
+บน node แรก:
+
+```bash
+pvecm create my-cluster
+```
+
+บน node อื่น:
+
+```bash
+pvecm add <IP-node1>
+```
+
+---
+
+## Step 2️⃣ ตรวจสอบ Quorum
+
+```bash
+pvecm status
+```
+
+ต้องเห็น:
+
+```
+Quorate: Yes
+```
+
+---
+
+## Step 3️⃣ ตั้งค่า Shared Storage
+
+ตัวอย่างเพิ่ม NFS:
+
+Datacenter → Storage → Add → NFS
+
+หรือ CLI:
+
+```bash
+pvesm add nfs nfs-storage \
+  --server 10.0.0.10 \
+  --export /data/proxmox \
+  --content images
+```
+
+---
+
+## Step 4️⃣ ย้าย VM ไป Shared Storage
+
+```bash
+qm move_disk 100 scsi0 nfs-storage
+```
+
+---
+
+## Step 5️⃣ เปิด HA ให้ VM
+
+### ผ่าน GUI:
+
+Datacenter → HA → Add
+เลือก VM → ตั้งค่า state = started
+
+### ผ่าน CLI:
+
+```bash
+ha-manager add vm:100
+```
+
+เช็ค status:
+
+```bash
+ha-manager status
+```
+
+---
+
+# 🔹 4. ทดสอบ HA
+
+Test ง่าย ๆ:
+
+```bash
+systemctl stop pve-cluster
+```
+
+หรือ simulate node down (ปิดเครื่องเลย)
+
+ดูว่า VM ถูก start บน node อื่นหรือไม่:
+
+```bash
+ha-manager status
+```
+
+---
+
+# 🔹 5. HA Policy & Behavior
+
+ค่า default:
+
+* restart max 1 ครั้ง
+* ถ้า fail หลายครั้งจะ freeze
+
+สามารถตั้ง group ได้:
+
+```bash
+ha-manager groupadd web-group --nodes node1,node2
+```
+
+เพิ่ม VM เข้า group:
+
+```bash
+ha-manager add vm:100 --group web-group
+```
+
+---
+
+# 🔹 6. Production Best Practice (สำคัญ)
+
+### 🔥 1) ใช้ Ceph ถ้าเป็น Production จริง
+
+* ไม่มี single point of failure
+* performance ดีกว่า NFS
+
+### 🔥 2) แยก Network
+
+* Corosync network แยก VLAN
+* Storage network แยก
+* VM traffic แยก
+
+### 🔥 3) อย่าใช้ Local Disk กับ HA
+
+ถ้า VM อยู่ local disk แล้วเปิด HA → VM จะ start ไม่ได้
+
+---
+
+# 🔹 7. ปัญหาที่พบบ่อย
+
+### ❌ No Quorum
+
+แก้โดยเพิ่ม node หรือ QDevice
+
+### ❌ HA Service stuck
+
+เช็ค:
+
+```bash
+journalctl -u pve-ha-crm
+journalctl -u pve-ha-lrm
+```
+
+### ❌ VM ไม่ย้าย
+
+90% เพราะใช้ local storage
+
+---
+
+# 🔹 8. Architecture ตัวอย่าง Production
+
+```
+        +-------------+
+        |  LoadBalancer |
+        +------+------+
+               |
+  --------------------------------
+  |              |               |
++-----+        +-----+         +-----+
+| PVE1|        | PVE2|         | PVE3|
++--+--+        +--+--+         +--+--+
+   |              |               |
+   +------ Ceph Cluster -----------+
+```
+
+---
+
+# 🔹 สรุปแบบสั้น
+
+| สิ่งที่ต้องมี  | จำเป็น   |
+| -------------- | -------- |
+| Cluster        | ✅        |
+| Quorum         | ✅        |
+| Shared Storage | ✅        |
+| HA Manager     | Built-in |
+
+---
+
+ถ้า Ar-Ty ต้องการ ผมสามารถทำ:
+
+* 🔥 Lab topology สำหรับ 2 node + QDevice
+* 🔥 Best practice สำหรับ Enterprise
+* 🔥 HA + Ceph design แบบ production
+* 🔥 เปรียบเทียบ Proxmox HA vs VMware HA
+* 🔥 Script auto deploy cluster
+
+อยากได้ระดับไหน? Lab / Production / Enterprise architecture?
+
+
+
